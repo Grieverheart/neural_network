@@ -7,6 +7,8 @@
 #include <random>
 #include <chrono>
 
+#include <immintrin.h>
+
 static auto rng = std::default_random_engine();
 
 struct NnLinearLayer
@@ -14,8 +16,8 @@ struct NnLinearLayer
     NnLinearLayer(size_t input_size_, size_t output_size_):
         input_size(input_size_), output_size(output_size_)
     {
-        weights = new double[input_size * output_size];
-        biases  = new double[output_size];
+        weights = new float[input_size * output_size];
+        biases  = new float[output_size];
 
         std::normal_distribution<> d(0.0, 1.0);
         for(size_t i = 0; i < (input_size * output_size); ++i) weights[i] = d(rng);
@@ -23,41 +25,57 @@ struct NnLinearLayer
         for(size_t i = 0; i < output_size; ++i) biases[i] = d(rng);
     }
 
-    void process_input(const double* input, double* output) const
+    void process_input(const float* input, float* output) const
     {
         for(size_t i = 0; i < output_size; ++i)
         {
-            output[i] = biases[i];
-            for(size_t j = 0; j < input_size; ++j) output[i] += weights[i * input_size + j] * input[j];
+            auto acc = _mm256_setzero_ps();
+            size_t last_index = 8 * (input_size / 8);
+            for(size_t j = 0; j < last_index; j += 8)
+            {
+                auto sse_w  = _mm256_loadu_ps(weights + i * input_size + j);
+                auto sse_in = _mm256_loadu_ps(input + j);
+                acc = _mm256_fmadd_ps(sse_w, sse_in, acc);
+            }
+
+            auto temp_sum = _mm_add_ps(_mm256_extractf128_ps(acc, 1), _mm256_castps256_ps128(acc));
+            temp_sum = _mm_add_ps(temp_sum, _mm_movehl_ps(temp_sum, temp_sum));
+            temp_sum = _mm_add_ss(temp_sum, _mm_shuffle_ps(temp_sum, temp_sum, 0x55));
+            float sum = _mm_cvtss_f32(temp_sum);
+
+            output[i] = biases[i] + sum;
+
+            for(size_t j = last_index; j < input_size; ++j)
+                output[i] += weights[i * input_size + j] * input[j];
         }
     }
 
     size_t input_size;
     size_t output_size;
 
-    double* weights;
-    double* biases;
+    float* weights;
+    float* biases;
 };
 
-double sigmoid(double x)
+float sigmoid(float x)
 {
     return 1.0 / (1.0 + exp(-x));
 }
 
-double sigmoid_prime(double x)
+float sigmoid_prime(float x)
 {
-    double s = sigmoid(x);
+    float s = sigmoid(x);
     return s * (1.0 - s);
 }
 
-void nn_run(const NnLinearLayer* layers, size_t num_layers, const double* input, double** output)
+void nn_run(const NnLinearLayer* layers, size_t num_layers, const float* input, float** output)
 {
-    double *temp_input = new double[layers[0].input_size];
-    memcpy(temp_input, input, layers[0].input_size * sizeof(double));
+    float *temp_input = new float[layers[0].input_size];
+    memcpy(temp_input, input, layers[0].input_size * sizeof(float));
 
     for(size_t i = 0; i < num_layers; ++i)
     {
-        double* temp_output = new double[layers[i].output_size];
+        float* temp_output = new float[layers[i].output_size];
         layers[i].process_input(temp_input, temp_output);
         for(size_t j = 0; j < layers[i].output_size; ++j) temp_output[j] = sigmoid(temp_output[j]);
         delete[] temp_input;
@@ -67,82 +85,11 @@ void nn_run(const NnLinearLayer* layers, size_t num_layers, const double* input,
     *output = temp_input;
 }
 
-void nn_backprop(
-    const NnLinearLayer* layers, size_t num_layers,
-    const double* input, const double* expected_output,
-    double*** delta_weights, double*** delta_biases
-){
-    // Feedforward
-    double** activation     = new double*[num_layers + 1];
-    double** weighted_input = new double*[num_layers];
-
-    activation[0] = new double[layers[0].input_size];
-    memcpy(activation[0], input, layers[0].input_size * sizeof(double));
-
-    for(size_t i = 0; i < num_layers; ++i)
-    {
-        weighted_input[i] = new double[layers[i].output_size];
-        layers[i].process_input(activation[i], weighted_input[i]);
-
-        activation[i + 1] = new double[layers[i].output_size];
-        for(size_t j = 0; j < layers[i].output_size; ++j) activation[i + 1][j] = sigmoid(weighted_input[i][j]);
-    }
-
-    double* error = new double[layers[num_layers - 1].output_size];
-    for(size_t i = 0; i < layers[num_layers - 1].output_size; ++i)
-        error[i] = (activation[num_layers][i] - expected_output[i]) * sigmoid_prime(weighted_input[num_layers - 1][i]);
-
-    double** delta_weights_ = new double*[num_layers];
-    double** delta_biases_  = new double*[num_layers];
-
-    for(size_t i = 0; i < num_layers; ++i)
-    {
-        size_t lidx = num_layers - 1 - i;
-
-        const auto& layer = layers[lidx];
-        delta_weights_[lidx] = new double[layer.input_size * layer.output_size];
-        delta_biases_[lidx]  = new double[layer.output_size];
-
-        for(size_t k = 0; k < layer.output_size; ++k)
-        {
-            for(size_t j = 0; j < layer.input_size; ++j) delta_weights_[lidx][k * layer.input_size + j] = error[k] * activation[lidx][j];
-            delta_biases_[lidx][k] = error[k];
-        }
-
-        if(lidx == 0) break;
-
-        double* new_error = new double[layer.input_size]{0};
-        for(size_t j = 0; j < layer.input_size; ++j)
-        {
-            for(size_t k = 0; k < layer.output_size; ++k) new_error[j] += layer.weights[k * layer.input_size + j] * error[k];
-            new_error[j] *= sigmoid_prime(weighted_input[lidx - 1][j]);
-        }
-
-        delete[] error;
-        error = new_error;
-    }
-
-    *delta_weights = delta_weights_;
-    *delta_biases  = delta_biases_;
-
-    delete[] error;
-
-    for(size_t i = 0; i < num_layers; ++i)
-    {
-        delete[] activation[i];
-        delete[] weighted_input[i];
-    }
-
-    delete[] activation[num_layers];
-    delete[] activation;
-    delete[] weighted_input;
-}
-
 void sgd_train(
     const NnLinearLayer* layers, size_t num_layers,
-    const double* train_data, const double* train_labels, size_t train_num_labels,
-    const double* test_data, const double* test_labels, size_t test_num_labels,
-    size_t num_epochs, size_t batch_size, double eta
+    const float* train_data, const float* train_labels, size_t train_num_labels,
+    const float* test_data, const float* test_labels, size_t test_num_labels,
+    size_t num_epochs, size_t batch_size, float eta
 ){
     size_t datum_size  = layers[0].input_size;
     size_t output_size = layers[num_layers - 1].output_size;
@@ -150,13 +97,27 @@ void sgd_train(
     size_t* index_batches = new size_t[train_num_labels];
     for(size_t i = 0; i < train_num_labels; ++i) index_batches[i] = i;
 
-    double** batch_delta_weights = new double*[num_layers];
-    double** batch_delta_biases  = new double*[num_layers];
+    float** batch_delta_weights = new float*[num_layers];
+    float** batch_delta_biases  = new float*[num_layers];
+
+    float** delta_weights = new float*[num_layers];
+    float** delta_biases  = new float*[num_layers];
+
+    float** activation     = new float*[num_layers + 1];
+    float** weighted_input = new float*[num_layers];
+
+    activation[0] = new float[layers[0].input_size];
 
     for(size_t lidx = 0; lidx < num_layers; ++lidx)
     {
-        batch_delta_weights[lidx] = new double[layers[lidx].input_size * layers[lidx].output_size];
-        batch_delta_biases[lidx]  = new double[layers[lidx].output_size];
+        batch_delta_weights[lidx] = new float[layers[lidx].input_size * layers[lidx].output_size];
+        batch_delta_biases[lidx]  = new float[layers[lidx].output_size];
+
+        delta_weights[lidx] = new float[layers[lidx].input_size * layers[lidx].output_size];
+        delta_biases[lidx]  = new float[layers[lidx].output_size];
+
+        activation[lidx + 1] = new float[layers[lidx].input_size];
+        weighted_input[lidx] = new float[layers[lidx].output_size];
     }
 
     for(size_t ei = 0; ei < num_epochs; ++ei)
@@ -174,48 +135,117 @@ void sgd_train(
 
             for(size_t lidx = 0; lidx < num_layers; ++lidx)
             {
-                memset(batch_delta_weights[lidx], 0, layers[lidx].input_size * layers[lidx].output_size * sizeof(double));
-                memset(batch_delta_biases[lidx], 0, layers[lidx].output_size * sizeof(double));
+                memset(batch_delta_weights[lidx], 0, layers[lidx].input_size * layers[lidx].output_size * sizeof(float));
+                memset(batch_delta_biases[lidx], 0, layers[lidx].output_size * sizeof(float));
             }
 
             for(size_t si = batch_start; si < batch_end; ++si)
             {
                 size_t sample_index = index_batches[si];
 
-                double **delta_weights, **delta_biases;
-                nn_backprop(
-                    layers, num_layers,
-                    &train_data[datum_size * sample_index], &train_labels[output_size * sample_index],
-                    &delta_weights, &delta_biases
-                );
+                for(size_t lidx = 0; lidx < num_layers; ++lidx)
+                {
+                }
+
+                // Backprop
+                {
+                    const float* input = &train_data[datum_size * sample_index];
+                    const float* expected_output = &train_labels[output_size * sample_index];
+
+                    memcpy(activation[0], input, layers[0].input_size * sizeof(float));
+
+                    // Feedforward
+                    for(size_t i = 0; i < num_layers; ++i)
+                    {
+                        layers[i].process_input(activation[i], weighted_input[i]);
+                        for(size_t j = 0; j < layers[i].output_size; ++j) activation[i + 1][j] = sigmoid(weighted_input[i][j]);
+                    }
+
+                    float* error = new float[layers[num_layers - 1].output_size];
+                    for(size_t i = 0; i < layers[num_layers - 1].output_size; ++i)
+                        error[i] = (activation[num_layers][i] - expected_output[i]) * sigmoid_prime(weighted_input[num_layers - 1][i]);
+
+                    for(size_t i = 0; i < num_layers; ++i)
+                    {
+                        size_t lidx = num_layers - 1 - i;
+
+                        const auto& layer = layers[lidx];
+
+                        for(size_t k = 0; k < layer.output_size; ++k)
+                        {
+                            auto error_x8 = _mm256_set1_ps(error[k]);
+                            for(size_t j = 0; j < 8 * (layer.input_size / 8); j += 8)
+                            {
+                                auto activation_x8 = _mm256_loadu_ps(activation[lidx] + j);
+                                _mm256_storeu_ps(delta_weights[lidx] + k * layer.input_size + j, _mm256_mul_ps(error_x8, activation_x8));
+                            }
+
+                            for(size_t j = 8 * (layer.input_size / 8); j < layer.input_size; ++j)
+                                delta_weights[lidx][k * layer.input_size + j] = error[k] * activation[lidx][j];
+
+                            delta_biases[lidx][k] = error[k];
+                        }
+
+                        if(lidx == 0) break;
+
+                        float* new_error = new float[layer.input_size];
+                        for(size_t j = 0; j < layer.input_size; ++j)
+                        {
+                            new_error[j] = 0.0;
+
+                            for(size_t k = 0; k < layer.output_size; ++k)
+                                new_error[j] += layer.weights[k * layer.input_size + j] * error[k];
+
+                            new_error[j] *= sigmoid_prime(weighted_input[lidx - 1][j]);
+                        }
+
+                        delete[] error;
+                        error = new_error;
+                    }
+
+                    delete[] error;
+                }
 
                 // Accumulate
-                size_t actual_batch_size = batch_end - batch_start;
+                float factor = 1.0f / (batch_end - batch_start);
+                auto factor_x8 = _mm256_set1_ps(factor);
                 for(size_t lidx = 0; lidx < num_layers; ++lidx)
                 {
                     for(size_t i = 0; i < layers[lidx].output_size; ++i)
                     {
-                        for(size_t j = 0; j < layers[lidx].input_size; ++j)
+                        size_t last_index = 8 * (layers[lidx].input_size / 8);
+                        for(size_t j = 0; j < last_index; j += 8)
+                        {
+                            auto sse_bw = _mm256_loadu_ps(batch_delta_weights[lidx] + i * layers[lidx].input_size + j);
+                            auto sse_w = _mm256_loadu_ps(delta_weights[lidx] + i * layers[lidx].input_size + j);
+                            auto result = _mm256_fmadd_ps(factor_x8, sse_w, sse_bw);
+                            _mm256_storeu_ps(batch_delta_weights[lidx] + i * layers[lidx].input_size + j, result);
+                        }
+                        for(size_t j = last_index; j < layers[lidx].input_size; ++j)
                         {
                             batch_delta_weights[lidx][i * layers[lidx].input_size + j] +=
-                                delta_weights[lidx][i * layers[lidx].input_size + j] / actual_batch_size;
+                                delta_weights[lidx][i * layers[lidx].input_size + j] * factor;
                         }
-                        batch_delta_biases[lidx][i] += delta_biases[lidx][i] / actual_batch_size;
+                        batch_delta_biases[lidx][i] += delta_biases[lidx][i] * factor;
                     }
-                    delete[] delta_weights[lidx];
-                    delete[] delta_biases[lidx];
                 }
-
-                delete[] delta_weights;
-                delete[] delta_biases;
             }
 
             // Update
+            auto eta_x8 = _mm256_set1_ps(eta);
             for(size_t lidx = 0; lidx < num_layers; ++lidx)
             {
                 for(size_t i = 0; i < layers[lidx].output_size; ++i)
                 {
-                    for(size_t j = 0; j < layers[lidx].input_size; ++j)
+                    size_t last_index = 8 * (layers[lidx].input_size / 8);
+                    for(size_t j = 0; j < last_index; j += 8)
+                    {
+                        auto sse_bw = _mm256_loadu_ps(batch_delta_weights[lidx] + i * layers[lidx].input_size + j);
+                        auto sse_w = _mm256_loadu_ps(layers[lidx].weights + i * layers[lidx].input_size + j);
+                        auto result = _mm256_fmsub_ps(eta_x8, sse_bw, sse_w);
+                        _mm256_storeu_ps(layers[lidx].weights + i * layers[lidx].input_size + j, result);
+                    }
+                    for(size_t j = last_index; j < layers[lidx].input_size; ++j)
                     {
                         layers[lidx].weights[i * layers[lidx].input_size + j] -=
                             batch_delta_weights[lidx][i * layers[lidx].input_size + j] * eta;
@@ -230,7 +260,7 @@ void sgd_train(
         size_t num_correct_data = 0;
         for(size_t i = 0; i < test_num_labels; ++i)
         {
-            double* output;
+            float* output;
             nn_run(layers, num_layers, &test_data[datum_size * i], &output);
 
             size_t max_index = std::distance(output, std::max_element(output, output + output_size));
@@ -239,17 +269,28 @@ void sgd_train(
             delete[] output;
         }
 
-        double time_elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_time).count();
+        float time_elapsed = std::chrono::duration<float>(std::chrono::high_resolution_clock::now() - start_time).count();
         printf("        Epoch done in %.3f seconds\n", time_elapsed);
         printf("        %llu out of %llu images predicted correctly!\n", num_correct_data, test_num_labels);
     }
-
 
     for(size_t lidx = 0; lidx < num_layers; ++lidx)
     {
         delete[] batch_delta_weights[lidx];
         delete[] batch_delta_biases[lidx];
+
+        delete[] delta_weights[lidx];
+        delete[] delta_biases[lidx];
+
+        delete[] activation[lidx];
+        delete[] weighted_input[lidx];
     }
+
+    delete[] activation[num_layers];
+    delete[] activation;
+    delete[] weighted_input;
+    delete[] delta_weights;
+    delete[] delta_biases;
     delete[] batch_delta_weights;
     delete[] batch_delta_biases;
     delete[] index_batches;
@@ -323,8 +364,8 @@ int main(int argc, char* argv[])
     std::random_device r;
     rng.seed(r());
 
-    double* train_images_float   = nullptr;
-    double* train_labels_one_hot = nullptr;
+    float* train_images_float   = nullptr;
+    float* train_labels_one_hot = nullptr;
     size_t train_num_labels = 0;
     size_t train_image_size = 0, train_num_images = 0;
     {
@@ -335,8 +376,8 @@ int main(int argc, char* argv[])
 
         assert(train_num_labels == train_num_images);
 
-        train_labels_one_hot = new double[train_num_labels * 10];
-        train_images_float   = new double[train_num_images * train_image_size];
+        train_labels_one_hot = new float[train_num_labels * 10];
+        train_images_float   = new float[train_num_images * train_image_size];
         for(size_t i = 0; i < train_num_images; ++i)
         {
             for(size_t j = 0; j < train_image_size; ++j)
@@ -347,8 +388,8 @@ int main(int argc, char* argv[])
         }
     }
 
-    double* test_images_float   = nullptr;
-    double* test_labels_one_hot = nullptr;
+    float* test_images_float   = nullptr;
+    float* test_labels_one_hot = nullptr;
     size_t test_num_labels = 0;
     size_t test_image_size = 0, test_num_images = 0;
     {
@@ -359,8 +400,8 @@ int main(int argc, char* argv[])
 
         assert(test_num_labels == test_num_images);
 
-        test_labels_one_hot = new double[test_num_labels * 10];
-        test_images_float   = new double[test_num_images * test_image_size];
+        test_labels_one_hot = new float[test_num_labels * 10];
+        test_images_float   = new float[test_num_images * test_image_size];
         for(size_t i = 0; i < test_num_images; ++i)
         {
             for(size_t j = 0; j < test_image_size; ++j)
@@ -381,7 +422,7 @@ int main(int argc, char* argv[])
 
     size_t num_epochs  = 30;
     size_t num_batches = 10;
-    double eta = 3.0;
+    float eta = 3.0;
 
     printf("Training started.\n");
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -391,7 +432,7 @@ int main(int argc, char* argv[])
         test_images_float,  test_labels_one_hot, test_num_labels,
         num_epochs, num_batches, eta
     );
-    double time_elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_time).count();
+    float time_elapsed = std::chrono::duration<float>(std::chrono::high_resolution_clock::now() - start_time).count();
     printf("Training %llu epochs finished in %.3f seconds.", num_epochs, time_elapsed);
 
 
