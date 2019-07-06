@@ -1,5 +1,5 @@
-use std::path::Path;
 use std::convert::AsRef;
+use std::path::Path;
 use std::io::Read;
 
 use rand::Rng;
@@ -7,13 +7,28 @@ use rand::prelude::thread_rng;
 use rand::distributions::StandardNormal;
 use rand::seq::SliceRandom;
 
+use std::arch::x86_64::_mm256_setzero_ps;
+use std::arch::x86_64::_mm256_mul_ps;
+use std::arch::x86_64::_mm256_loadu_ps;
+use std::arch::x86_64::_mm256_fmadd_ps;
+use std::arch::x86_64::_mm256_fmsub_ps;
+use std::arch::x86_64::_mm256_extractf128_ps;
+use std::arch::x86_64::_mm256_castps256_ps128;
+use std::arch::x86_64::_mm_add_ps;
+use std::arch::x86_64::_mm_add_ss;
+use std::arch::x86_64::_mm_movehl_ps;
+use std::arch::x86_64::_mm_shuffle_ps;
+use std::arch::x86_64::_mm_cvtss_f32;
+use std::arch::x86_64::_mm256_set1_ps;
+use std::arch::x86_64::_mm256_storeu_ps;
+
 struct NnLinearLayer
 {
     input_size:  usize,
     output_size: usize,
 
-    weights: Vec<f64>,
-    biases:  Vec<f64>,
+    weights: Vec<f32>,
+    biases:  Vec<f32>,
 }
 
 impl NnLinearLayer
@@ -21,9 +36,9 @@ impl NnLinearLayer
     fn new(input_size: usize, output_size: usize) -> NnLinearLayer
     {
         let weights = thread_rng().sample_iter(&StandardNormal)
-                        .take(input_size * output_size).collect();
+                        .take(input_size * output_size).map(|x| x as f32).collect();
         let biases  = thread_rng().sample_iter(&StandardNormal)
-                        .take(output_size).collect();
+                        .take(output_size).map(|x| x as f32).collect();
 
         NnLinearLayer{
             input_size: input_size,
@@ -32,164 +47,237 @@ impl NnLinearLayer
         }
     }
 
-    fn process(&self, input: &[f64]) -> Vec<f64>
+    fn process_input(&self, input: &[f32]) -> Vec<f32>
     {
         assert!(input.len() == self.input_size);
-        let mut output = self.biases.clone();
-        for i in 0..self.output_size
+
+        let mut output = Vec::with_capacity(self.output_size);
+        let last_index = 8 * (self.input_size / 8);
+
+        unsafe
         {
-            for j in 0..self.input_size
+            output.set_len(self.output_size);
+
+            for i in 0..self.output_size
             {
-                output[i] += self.weights[i * self.input_size + j] * input[j];
+                let mut acc = _mm256_setzero_ps();
+                for j in (0..last_index).step_by(8)
+                {
+                    let sse_w  = _mm256_loadu_ps(self.weights.as_ptr().offset((i * self.input_size + j) as isize));
+                    let sse_in = _mm256_loadu_ps(input.as_ptr().offset(j as isize));
+                    acc = _mm256_fmadd_ps(sse_w, sse_in, acc);
+                }
+
+                let temp_sum = _mm_add_ps(_mm256_extractf128_ps(acc, 1), _mm256_castps256_ps128(acc));
+                let temp_sum = _mm_add_ps(temp_sum, _mm_movehl_ps(temp_sum, temp_sum));
+                let temp_sum = _mm_add_ss(temp_sum, _mm_shuffle_ps(temp_sum, temp_sum, 0x55));
+                let sum = _mm_cvtss_f32(temp_sum);
+
+                output[i] = self.biases[i] + sum;
+
+                for j in last_index..self.input_size
+                {
+                    output[i] += self.weights[i * self.input_size + j] * input[j];
+                }
             }
         }
+
         output
     }
 }
 
-fn sigmoid(x: f64) -> f64
+fn sigmoid(x: f32) -> f32
 {
     1.0 / (1.0 + (-x).exp())
 }
 
-fn sigmoid_prime(x: f64) -> f64
+fn sigmoid_prime(x: f32) -> f32
 {
     let s = sigmoid(x);
     s * (1.0 - s)
 }
 
-fn nn_run(layers: &[NnLinearLayer], input: &[f64]) -> Vec<f64>
+fn nn_run(layers: &[NnLinearLayer], input: &[f32]) -> Vec<f32>
 {
-    let mut output = vec![0.0; input.len()];
-    output.clone_from_slice(input);
-
-    for i in 0..layers.len()
-    {
-        output = layers[i].process(&output).iter().map(|&x| sigmoid(x)).collect();
-    }
+    let mut output = input.to_vec();
+    for i in 0..layers.len() { output = layers[i].process_input(&output).iter().map(|&x| sigmoid(x)).collect() }
     output
-}
-
-fn nn_backprop(layers: &[NnLinearLayer], input: &[f64], expected_output: &[f64]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>)
-{
-    let num_layers = layers.len();
-
-    // Feedforward
-    let mut activation     = vec![Vec::new(); num_layers + 1];
-    let mut weighted_input = vec![Vec::new(); num_layers];
-
-    activation[0] = input.to_vec();
-
-    for i in 0..num_layers
-    {
-        let wi: Vec<f64> = layers[i].process(&activation[i]);
-        let layer_activation = wi.iter().map(|&x| sigmoid(x)).collect::<Vec<f64>>();
-
-        weighted_input[i] = wi.to_vec();
-        activation[i + 1] = layer_activation.to_vec();
-    }
-
-    let mut error = ((0..activation[num_layers].len()).map(
-        |i| (activation[num_layers][i] - expected_output[i]) *
-            sigmoid_prime(weighted_input[num_layers - 1][i])
-    ).collect::<Vec<f64>>()).to_vec();
-
-    let mut delta_weights = vec![Vec::new(); num_layers];
-    let mut delta_biases  = vec![Vec::new(); num_layers];
-
-    for lidx in (0..num_layers).rev()
-    {
-        let layer = &layers[lidx];
-        delta_weights[lidx].resize_with(layer.input_size * layer.output_size, || 0.0);
-        delta_biases[lidx].resize_with(layer.input_size, || 0.0);
-
-        for k in 0..layer.output_size
-        {
-            for j in 0..layer.input_size
-            {
-                delta_weights[lidx][k * layer.input_size + j] = error[k] * activation[lidx][j];
-            }
-            delta_biases[lidx][k] = error[k];
-        }
-
-        if lidx == 0
-        {
-            break;
-        }
-
-        let mut new_error = vec![0.0; layer.input_size];
-
-        for j in 0..layer.input_size
-        {
-            for k in 0..layer.output_size
-            {
-                new_error[j] += layer.weights[k * layer.input_size + j] * error[k];
-            }
-            new_error[j] *= sigmoid_prime(weighted_input[lidx - 1][j]);
-        }
-
-        error = new_error;
-    }
-
-    (delta_weights, delta_biases)
 }
 
 fn sgd_train(
     layers: &mut [NnLinearLayer],
-    train_data: &Vec<Vec<f64>>, train_labels: &Vec<Vec<f64>>,
-    test_data:  &Vec<Vec<f64>>, test_labels:  &Vec<Vec<f64>>,
-    num_epochs: usize, batch_size: usize, eta: f64
+    train_data: &Vec<Vec<f32>>, train_labels: &Vec<Vec<f32>>,
+    test_data:  &Vec<Vec<f32>>, test_labels:  &Vec<Vec<f32>>,
+    num_epochs: usize, batch_size: usize, eta: f32
 ){
+    let num_layers = layers.len();
+
+    let mut index_batches = (1..train_labels.len()).collect::<Vec<_>>();
+
+    let mut batch_delta_weights: Vec<Vec<f32>> = vec![Vec::new(); num_layers];
+    let mut batch_delta_biases: Vec<Vec<f32>>  = vec![Vec::new(); num_layers];
+
+    let mut delta_weights = vec![Vec::new(); num_layers];
+    let mut delta_biases  = vec![Vec::new(); num_layers];
+
+    let mut activation     = vec![Vec::new(); num_layers + 1];
+    let mut weighted_input = vec![Vec::new(); num_layers];
+
+    for lidx in 0..num_layers
+    {
+        batch_delta_weights[lidx].resize_with(layers[lidx].input_size * layers[lidx].output_size, || 0.0);
+        batch_delta_biases[lidx].resize_with(layers[lidx].output_size, || 0.0);
+
+        delta_weights[lidx].resize_with(layers[lidx].input_size * layers[lidx].output_size, || 0.0);
+        delta_biases[lidx].resize_with(layers[lidx].output_size, || 0.0);
+    }
+
     for ei in 0..num_epochs
     {
         println!("    Training epoch {}", ei);
         let timer = std::time::Instant::now();
-        let mut index_batches = (1..train_labels.len()).collect::<Vec<_>>();
         index_batches.shuffle(&mut thread_rng());
 
-        let index_batches = index_batches.chunks(batch_size);
-        for batch_indices in index_batches
+        for batch_indices in index_batches.chunks(batch_size)
         {
-            let mut batch_delta_weights: Vec<Vec<f64>> = vec![Vec::new(); layers.len()];
-            let mut batch_delta_biases: Vec<Vec<f64>>  = vec![Vec::new(); layers.len()];
 
-            for lidx in 0..layers.len()
+            for lidx in 0..num_layers
             {
-                batch_delta_weights[lidx].resize_with(layers[lidx].weights.len(), Default::default);
-                batch_delta_biases[lidx].resize_with(layers[lidx].biases.len(), Default::default);
+                for v in &mut batch_delta_weights[lidx] { *v = 0.0 }
+                for v in &mut batch_delta_biases[lidx]  { *v = 0.0 }
             }
 
             for &sample_index in batch_indices
             {
                 let actual_batch_size = batch_indices.len();
-                let (delta_weights, delta_biases) = nn_backprop(layers, &train_data[sample_index], &train_labels[sample_index]);
+                // Backprop
+                {
+                    // Feedforward
+
+                    activation[0].clone_from(&train_data[sample_index]);
+
+                    for lidx in 0..num_layers
+                    {
+                        weighted_input[lidx] = layers[lidx].process_input(&activation[lidx]);
+                        activation[lidx + 1] = weighted_input[lidx].iter().map(|&x| sigmoid(x)).collect::<Vec<f32>>();
+                    }
+
+                    let mut error = (0..activation[num_layers].len()).map(
+                        |i| (activation[num_layers][i] - train_labels[sample_index][i]) *
+                            sigmoid_prime(weighted_input[num_layers - 1][i])
+                    ).collect::<Vec<f32>>();
+
+                    for lidx in (0..num_layers).rev()
+                    {
+                        let layer = &layers[lidx];
+
+                        let last_index = 8 * (layer.input_size / 8);
+                        for k in 0..layer.output_size
+                        {
+                            unsafe
+                            {
+                                let error_x8 = _mm256_set1_ps(error[k]);
+                                for j in (0..last_index).step_by(8)
+                                {
+                                    let activation_x8 = _mm256_loadu_ps(activation[lidx].as_ptr().offset(j as isize));
+                                    _mm256_storeu_ps(
+                                        delta_weights[lidx].as_mut_ptr().offset((k * layer.input_size + j) as isize),
+                                        _mm256_mul_ps(error_x8, activation_x8)
+                                    );
+                                }
+                            }
+
+                            for j in last_index..layer.input_size
+                            {
+                                delta_weights[lidx][k * layer.input_size + j] = error[k] * activation[lidx][j];
+                            }
+                            delta_biases[lidx][k] = error[k];
+                        }
+
+                        if lidx == 0
+                        {
+                            break;
+                        }
+
+                        let mut new_error = vec![0.0; layer.input_size];
+
+                        for j in 0..layer.input_size
+                        {
+                            for k in 0..layer.output_size { new_error[j] += layer.weights[k * layer.input_size + j] * error[k] }
+                            new_error[j] *= sigmoid_prime(weighted_input[lidx - 1][j]);
+                        }
+
+                        error = new_error;
+                    }
+                }
 
                 // Accumulate
-                for lidx in 0..layers.len()
+                unsafe
                 {
-                    for i in 0..layers[lidx].output_size
+                    let factor = 1.0 / actual_batch_size as f32;
+                    let factor_x8 = _mm256_set1_ps(factor);
+
+                    for lidx in 0..num_layers
                     {
-                        for j in 0..layers[lidx].input_size
+                        let last_index = 8 * (layers[lidx].input_size / 8);
+                        for i in 0..layers[lidx].output_size
                         {
-                            batch_delta_weights[lidx][i * layers[lidx].input_size + j] +=
-                                delta_weights[lidx][i * layers[lidx].input_size + j] / actual_batch_size as f64;
+                            for j in (0..last_index).step_by(8)
+                            {
+                                let sse_bw = _mm256_loadu_ps(
+                                    batch_delta_weights[lidx].as_ptr().offset((i * layers[lidx].input_size + j) as isize)
+                                );
+                                let sse_w  = _mm256_loadu_ps(
+                                    delta_weights[lidx].as_ptr().offset((i * layers[lidx].input_size + j) as isize)
+                                );
+                                let result = _mm256_fmadd_ps(factor_x8, sse_w, sse_bw);
+
+                                _mm256_storeu_ps(
+                                    batch_delta_weights[lidx].as_mut_ptr().offset((i * layers[lidx].input_size + j) as isize),
+                                    result
+                                );
+                            }
+                            for j in last_index..layers[lidx].input_size
+                            {
+                                batch_delta_weights[lidx][i * layers[lidx].input_size + j] +=
+                                    delta_weights[lidx][i * layers[lidx].input_size + j] * factor;
+                            }
+                            batch_delta_biases[lidx][i] += delta_biases[lidx][i] * factor;
                         }
-                        batch_delta_biases[lidx][i] += delta_biases[lidx][i] / actual_batch_size as f64;
                     }
                 }
             }
 
             // Update
-            for lidx in 0..layers.len()
+            unsafe
             {
-                for i in 0..layers[lidx].output_size
+                let eta_x8 = _mm256_set1_ps(eta);
+                for lidx in 0..num_layers
                 {
-                    for j in 0..layers[lidx].input_size
+                    let last_index = 8 * (layers[lidx].input_size / 8);
+                    for i in 0..layers[lidx].output_size
                     {
-                        layers[lidx].weights[i * layers[lidx].input_size + j] -=
-                            batch_delta_weights[lidx][i * layers[lidx].input_size + j] * eta;
+                        for j in (0..last_index).step_by(8)
+                        {
+                            let sse_bw = _mm256_loadu_ps(
+                                batch_delta_weights[lidx].as_ptr().offset((i * layers[lidx].input_size + j) as isize)
+                            );
+                            let sse_w  = _mm256_loadu_ps(
+                                layers[lidx].weights.as_ptr().offset((i * layers[lidx].input_size + j) as isize)
+                            );
+                            let result = _mm256_fmsub_ps(eta_x8, sse_bw, sse_w);
+                            _mm256_storeu_ps(
+                                layers[lidx].weights.as_mut_ptr().offset((i * layers[lidx].input_size + j) as isize),
+                                result
+                            );
+                        }
+                        for j in last_index..layers[lidx].input_size
+                        {
+                            layers[lidx].weights[i * layers[lidx].input_size + j] -=
+                                batch_delta_weights[lidx][i * layers[lidx].input_size + j] * eta;
+                        }
+                        layers[lidx].biases[i] -= batch_delta_biases[lidx][i] * eta;
                     }
-                    layers[lidx].biases[i] -= batch_delta_biases[lidx][i] * eta;
                 }
             }
 
@@ -212,10 +300,7 @@ fn sgd_train(
                 }
             }
 
-            if test_labels[i][max_index] == 1.0
-            {
-                num_correct_data += 1;
-            }
+            if test_labels[i][max_index] == 1.0 { num_correct_data += 1 }
         }
 
         let time_elapsed = timer.elapsed();
@@ -253,9 +338,7 @@ fn read_labels<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<u8>>
 
 struct Images
 {
-    num_images: usize,
-    width:      usize,
-    height:     usize,
+    image_size: usize,
     data:       Vec<u8>,
 }
 
@@ -290,9 +373,7 @@ fn read_images<P: AsRef<Path>>(path: P) -> std::io::Result<Images>
 
     let mut images = Images
     {
-        num_images: num_images as usize,
-        width:      num_cols as usize,
-        height:     num_rows as usize,
+        image_size: (num_cols * num_rows) as usize,
         data:       Vec::new()
     };
 
@@ -311,29 +392,21 @@ fn main() -> std::io::Result<()>
     let test_labels = read_labels("data/t10k-labels.idx1-ubyte")?;
     let test_images = read_images("data/t10k-images.idx3-ubyte")?;
 
-    let image_size = train_images.width * train_images.height;
-
     let train_images_float = train_images.data.iter().map(
-        |&x| (x as f64) / 255.0
+        |&x| (x as f32) / 255.0
     ).collect::<Vec<_>>();
-    let train_images_float = train_images_float.chunks(image_size).map(|x| x.to_vec()).collect::<Vec<_>>();
+    let train_images_float = train_images_float.chunks(train_images.image_size).map(|x| x.to_vec()).collect::<Vec<_>>();
 
     let test_images_float = test_images.data.iter().map(
-        |&x| (x as f64) / 255.0
+        |&x| (x as f32) / 255.0
     ).collect::<Vec<_>>();
-    let test_images_float = test_images_float.chunks(image_size).map(|x| x.to_vec()).collect::<Vec<_>>();
+    let test_images_float = test_images_float.chunks(test_images.image_size).map(|x| x.to_vec()).collect::<Vec<_>>();
 
     let mut train_labels_one_hot = vec![vec![0.0; 10]; train_labels.len()];
-    for i in 0..train_labels.len()
-    {
-        train_labels_one_hot[i][train_labels[i] as usize] = 1.0;
-    }
+    for i in 0..train_labels.len() { train_labels_one_hot[i][train_labels[i] as usize] = 1.0 }
 
     let mut test_labels_one_hot = vec![vec![0.0; 10]; test_labels.len()];
-    for i in 0..test_labels.len()
-    {
-        test_labels_one_hot[i][test_labels[i] as usize] = 1.0;
-    }
+    for i in 0..test_labels.len() { test_labels_one_hot[i][test_labels[i] as usize] = 1.0 }
 
     let mut layers = vec![
         NnLinearLayer::new(784, 30),
