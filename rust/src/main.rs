@@ -35,9 +35,10 @@ impl NnLinearLayer
 {
     fn new(input_size: usize, output_size: usize) -> NnLinearLayer
     {
-        let weights = thread_rng().sample_iter(&StandardNormal)
+        let mut rng = thread_rng();
+        let weights = rng.sample_iter(&StandardNormal)
                         .take(input_size * output_size).map(|x| x as f32).collect();
-        let biases  = thread_rng().sample_iter(&StandardNormal)
+        let biases  = rng.sample_iter(&StandardNormal)
                         .take(output_size).map(|x| x as f32).collect();
 
         NnLinearLayer{
