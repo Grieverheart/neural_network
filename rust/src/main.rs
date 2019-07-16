@@ -314,20 +314,15 @@ fn read_labels<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<u8>>
 {
     let mut fs_labels = std::fs::File::open(path)?;
 
-    let mut magic_number: u32 = 0;
-    let mut num_items:    u32 = 0;
-    unsafe
-    {
-        let mut u32_bytes = std::slice::from_raw_parts_mut(&mut magic_number as *mut u32 as *mut u8, 4);
-        fs_labels.read_exact(&mut u32_bytes)?;
-        u32_bytes.reverse();
+    let mut u32_bytes: [u8; 4] = [0; 4];
 
-        assert!(magic_number == 0x801);
+    fs_labels.read_exact(&mut u32_bytes)?;
+    let magic_number = u32::from_be_bytes(u32_bytes);
 
-        let mut u32_bytes = std::slice::from_raw_parts_mut(&mut num_items as *mut u32 as *mut u8, 4);
-        fs_labels.read_exact(&mut u32_bytes)?;
-        u32_bytes.reverse();
-    }
+    assert!(magic_number == 0x801);
+
+    fs_labels.read_exact(&mut u32_bytes)?;
+    let mut num_items = u32::from_be_bytes(u32_bytes);
 
     let mut labels: Vec<u8> = Vec::new();
     fs_labels.read_to_end(&mut labels)?;
@@ -347,30 +342,21 @@ fn read_images<P: AsRef<Path>>(path: P) -> std::io::Result<Images>
 {
     let mut fs_images = std::fs::File::open(path)?;
 
-    let mut magic_number: u32 = 0;
-    let mut num_images:   u32 = 0;
-    let mut num_rows:     u32 = 0;
-    let mut num_cols:     u32 = 0;
-    unsafe
-    {
-        let mut u32_bytes = std::slice::from_raw_parts_mut(&mut magic_number as *mut u32 as *mut u8, 4);
-        fs_images.read_exact(&mut u32_bytes)?;
-        u32_bytes.reverse();
+    let mut u32_bytes: [u8; 4] = [0; 4];
 
-        assert!(magic_number == 0x803);
+    fs_images.read_exact(&mut u32_bytes)?;
+    let magic_number = u32::from_be_bytes(u32_bytes);
 
-        let mut u32_bytes = std::slice::from_raw_parts_mut(&mut num_images as *mut u32 as *mut u8, 4);
-        fs_images.read_exact(&mut u32_bytes)?;
-        u32_bytes.reverse();
+    assert!(magic_number == 0x803);
 
-        let mut u32_bytes = std::slice::from_raw_parts_mut(&mut num_rows as *mut u32 as *mut u8, 4);
-        fs_images.read_exact(&mut u32_bytes)?;
-        u32_bytes.reverse();
+    fs_images.read_exact(&mut u32_bytes)?;
+    let num_images = u32::from_be_bytes(u32_bytes);
 
-        let mut u32_bytes = std::slice::from_raw_parts_mut(&mut num_cols as *mut u32 as *mut u8, 4);
-        fs_images.read_exact(&mut u32_bytes)?;
-        u32_bytes.reverse();
-    }
+    fs_images.read_exact(&mut u32_bytes)?;
+    let num_rows = u32::from_be_bytes(u32_bytes);
+
+    fs_images.read_exact(&mut u32_bytes)?;
+    let num_cols = u32::from_be_bytes(u32_bytes);
 
     let mut images = Images
     {
